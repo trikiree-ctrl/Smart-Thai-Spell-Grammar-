@@ -4,7 +4,13 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
-import { runOfflineLexiconSpellCheck, estimateThaiWordCount, applyCorrections, type SpellError } from './src/utils/thaiSpellEngine.ts';
+import {
+  runOfflineLexiconSpellCheck,
+  estimateThaiWordCount,
+  applyCorrections,
+  computeLocationAndContext,
+  type SpellError
+} from './src/utils/thaiSpellEngine.ts';
 
 dotenv.config();
 
@@ -140,6 +146,7 @@ ${text}
         searchCursor = endIndex;
       }
 
+      const loc = computeLocationAndContext(text, startIndex, item.original.length);
       mappedErrors.push({
         id: `ai_${i}_${Date.now()}`,
         original: item.original,
@@ -152,6 +159,10 @@ ${text}
         endIndex,
         status: 'pending',
         severity: (['high', 'medium', 'low'].includes(item.severity) ? item.severity : 'medium') as SpellError['severity'],
+        pageNumber: loc.pageNumber,
+        lineIndex: loc.lineIndex,
+        paragraphIndex: loc.paragraphIndex,
+        context: loc.context
       });
     }
 

@@ -133,3 +133,43 @@ test('calculateWeeklyStats aggregates top errors and categories', () => {
   assert.equal(report.categoryBreakdown.spelling, 4);
   assert.equal(report.categoryBreakdown.formal, 1);
 });
+
+test('computeLocationAndContext returns correct page, line, paragraph and context snippet', () => {
+  const doc = 'ย่อหน้าที่ 1 บรรทัดแรก\n\nย่อหน้าที่ 2 มีคำว่า พิจรณา อนุมัติโครงการ';
+  const check = runOfflineLexiconSpellCheck(doc);
+  const error = check.errors.find(e => e.original === 'พิจรณา');
+
+  assert.ok(error, 'Should find error for "พิจรณา"');
+  assert.equal(error?.pageNumber, 1);
+  assert.equal(error?.paragraphIndex, 2);
+  assert.ok(error?.context.includes('[พิจรณา]'), 'Context snippet should highlight target word');
+});
+
+test('export utilities format CSV, JSON, and Word Find/Replace correctly', async () => {
+  const doc = 'โรงเรียนมีกฏหมาย';
+  const check = runOfflineLexiconSpellCheck(doc);
+
+  const csvBlob = (await import('./thaiSpellEngine.ts')).exportErrorsToCsvBlob(check.errors, 'test.docx');
+  assert.equal(csvBlob.type, 'text/csv;charset=utf-8');
+  const csvText = await csvBlob.text();
+  assert.ok(csvText.includes('กฏหมาย'));
+  assert.ok(csvText.includes('กฎหมาย'));
+
+  const jsonBlob = (await import('./thaiSpellEngine.ts')).exportErrorsToJsonBlob(check.errors, 'test.docx');
+  const jsonText = await jsonBlob.text();
+  const parsed = JSON.parse(jsonText);
+  assert.equal(parsed.documentName, 'test.docx');
+  assert.equal(parsed.corrections[0].original, 'กฏหมาย');
+
+  const wordText = (await import('./thaiSpellEngine.ts')).exportErrorsToWordFindReplaceText(check.errors, 'test.docx');
+  assert.ok(wordText.includes('ค้นหาคำว่า (Find): "กฏหมาย"'));
+  assert.ok(wordText.includes('แทนที่ด้วย (Replace): "กฎหมาย"'));
+});
+
+test('replaceOpenXmlTextNode safely modifies Word XML text tags', async () => {
+  const { replaceOpenXmlTextNode } = await import('./fileHandler.ts');
+  const sampleXml = '<w:p><w:r><w:t>ขอให้ พิจรณา อนุมัติ</w:t></w:r></w:p>';
+  const patched = replaceOpenXmlTextNode(sampleXml, 'พิจรณา', 'พิจารณา');
+  assert.equal(patched, '<w:p><w:r><w:t>ขอให้ พิจารณา อนุมัติ</w:t></w:r></w:p>');
+});
+

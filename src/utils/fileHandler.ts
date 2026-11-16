@@ -1,124 +1,268 @@
 import mammoth from 'mammoth';
 import { Document, Paragraph, TextRun, HeadingLevel, Packer } from 'docx';
+import JSZip from 'jszip';
+import * as pdfjsLib from 'pdfjs-dist';
+
+// Configure pdfjs-dist worker for browser environments
+if (typeof window !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
+  try {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+      'pdfjs-dist/build/pdf.worker.min.mjs',
+      import.meta.url
+    ).href;
+  } catch {
+    // Fallback if environment doesn't support relative worker URL
+  }
+}
+
+export interface ExtractedDocument {
+  text: string;
+  fileType: string;
+  fileName: string;
+  originalBuffer?: ArrayBuffer;
+  pageCount?: number;
+  isWarning?: boolean;
+}
 
 /**
  * Extract plain text from supported document files (.docx, .pdf, .txt, .md)
+ * Defensively handles binary files and scanned PDFs without producing alien/garbled characters
  */
-export async function extractTextFromFile(file: File): Promise<{ text: string; fileType: string; fileName: string }> {
+export async function extractTextFromFile(file: File): Promise<ExtractedDocument> {
   const fileName = file.name;
   const extension = fileName.substring(fileName.lastIndexOf('.')).toLowerCase();
 
+  // 1. Modern Word Documents (.docx)
   if (extension === '.docx') {
-    const arrayBuffer = await file.arrayBuffer();
-    const result = await mammoth.extractRawText({ arrayBuffer });
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const result = await mammoth.extractRawText({ arrayBuffer });
+      const text = (result.value || '').trim();
+      if (!text) {
+        return {
+          text: '⚠️ ไม่พบข้อความในไฟล์ .docx นี้ หรือเอกสารไม่มีเนื้อหาที่เป็นข้อความ',
+          fileType: 'docx',
+          fileName,
+          isWarning: true
+        };
+      }
+      return {
+        text,
+        fileType: 'docx',
+        fileName,
+        originalBuffer: arrayBuffer,
+        isWarning: false
+      };
+    } catch (docxErr) {
+      console.warn('Failed to parse docx:', docxErr);
+      return {
+        text: '⚠️ ไม่สามารถอ่านไฟล์ .docx นี้ได้ กรุณาตรวจสอบว่าไฟล์ไม่เสียหาย หรือบันทึกใหม่ใน Microsoft Word',
+        fileType: 'docx',
+        fileName,
+        isWarning: true
+      };
+    }
+  }
+
+  // 2. Legacy Word Documents (.doc - Word 97-2003 binary format)
+  if (extension === '.doc') {
     return {
-      text: result.value || '',
-      fileType: 'docx',
+      text: '⚠️ ไฟล์นี้เป็นรูปแบบ Microsoft Word รุ่นเก่า (.doc ซึ่งเป็นไฟล์ไบนารีเข้ารหัสเดิม)\n\nกรุณาเปิดไฟล์ในโปรแกรม Microsoft Word แล้วเลือก "บันทึกเป็น (Save As)" เป็นรูปแบบ .docx หรือคัดลอกข้อความจากเอกสารมาวางในช่องนี้โดยตรงครับ',
+      fileType: 'doc',
       fileName,
+      isWarning: true
     };
   }
 
+  // 3. PDF Documents (.pdf)
   if (extension === '.pdf') {
-    // Basic reliable PDF textual stream extractor
-    const arrayBuffer = await file.arrayBuffer();
-    const text = await extractTextFromPdfArrayBuffer(arrayBuffer);
-    return {
-      text: text || 'ไม่สามารถดึงข้อความจากไฟล์ PDF นี้ได้ หรือไฟล์อาจเป็นภาพสแกน (OCR Required)',
-      fileType: 'pdf',
-      fileName,
-    };
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const { text, pageCount } = await extractTextFromPdfWithPdfJs(arrayBuffer);
+      if (!text || text.trim().length === 0) {
+        return {
+          text: '⚠️ ไม่พบข้อความที่สามารถคัดลอกได้ในไฟล์ PDF นี้\n\nสาเหตุ: เอกสารนี้อาจเป็น "ภาพถ่ายหรือภาพสแกน (Scanned Image PDF)" ซึ่งไม่มี Text Layer ข้อความภายในไฟล์\n\nวิธีแก้ไข: กรุณาคัดลอกข้อความจากเอกสารมาวางในช่องนี้โดยตรง หรือใช้ไฟล์ต้นฉบับ .docx / .txt ครับ',
+          fileType: 'pdf',
+          fileName,
+          isWarning: true
+        };
+      }
+      return {
+        text,
+        fileType: 'pdf',
+        fileName,
+        originalBuffer: arrayBuffer,
+        pageCount,
+        isWarning: false
+      };
+    } catch (pdfErr) {
+      console.warn('PDF.js parsing error:', pdfErr);
+      return {
+        text: '⚠️ ไม่สามารถดึงข้อความจากไฟล์ PDF นี้ได้ เอกสารอาจมีการเข้ารหัสป้องกันหรือเป็นภาพสแกน กรุณาคัดลอกข้อความมาวางโดยตรงครับ',
+        fileType: 'pdf',
+        fileName,
+        isWarning: true
+      };
+    }
   }
 
-  // Fallback for .txt, .md, .csv, etc.
-  const text = await file.text();
+  // 4. Plain Text (.txt, .md, .csv)
+  try {
+    const text = await file.text();
+    // Safety check: verify the text doesn't contain binary null bytes or compressed data
+    if (isBinaryGarbage(text)) {
+      return {
+        text: '⚠️ รูปแบบไฟล์ไม่รองรับ (ตรวจพบข้อมูลไบนารี) กรุณาใช้ไฟล์เอกสาร .docx, .pdf หรือ .txt ที่ถูกต้อง',
+        fileType: extension.replace('.', '') || 'unknown',
+        fileName,
+        isWarning: true
+      };
+    }
+    return {
+      text,
+      fileType: extension.replace('.', '') || 'txt',
+      fileName,
+      isWarning: false
+    };
+  } catch (err) {
+    return {
+      text: '⚠️ ไม่สามารถเปิดไฟล์นี้ได้ กรุณาลองใหม่อีกครั้งหรือคัดลอกข้อความมาวาง',
+      fileType: extension.replace('.', '') || 'unknown',
+      fileName,
+      isWarning: true
+    };
+  }
+}
+
+/**
+ * Check if extracted text is actually binary garbage (e.g. raw binary file opened as text)
+ */
+function isBinaryGarbage(text: string): boolean {
+  if (!text || text.length === 0) return false;
+  // Check for null characters or high concentration of unprintable control characters
+  const sample = text.slice(0, 1000);
+  let unprintableCount = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const code = sample.charCodeAt(i);
+    // null byte or control chars (except \r, \n, \t)
+    if (code === 0 || (code < 32 && code !== 9 && code !== 10 && code !== 13)) {
+      unprintableCount++;
+    }
+  }
+  return unprintableCount > 10;
+}
+
+/**
+ * Robust PDF text extractor using pdfjs-dist
+ * Decodes all font CMaps, ToUnicode maps, and FlateDecode streams accurately
+ * Embeds page markers so page locations are tracked precisely
+ */
+async function extractTextFromPdfWithPdfJs(buffer: ArrayBuffer): Promise<{ text: string; pageCount: number }> {
+  const loadingTask = pdfjsLib.getDocument({
+    data: new Uint8Array(buffer),
+    verbosity: 0,
+  });
+
+  const pdf = await loadingTask.promise;
+  const pageTexts: string[] = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const textContent = await page.getTextContent();
+    const strings = textContent.items
+      .map((item: any) => item.str || '')
+      .filter((s: string) => s.trim().length > 0);
+
+    if (strings.length > 0) {
+      const pageBody = strings.join(' ');
+      pageTexts.push(`--- หน้า ${pageNum} ---\n${pageBody}`);
+    }
+  }
+
   return {
-    text,
-    fileType: extension.replace('.', '') || 'txt',
-    fileName,
+    text: pageTexts.join('\n\n\f'),
+    pageCount: pdf.numPages
   };
 }
 
 /**
- * Lightweight browser PDF text extractor
- * Parses PDF literal streams, text operators (BT ... ET, Tj, TJ) without external heavyweight dependencies
+ * Patch an original Word (.docx) document buffer by replacing confirmed typos
+ * inside word/document.xml, word/header*.xml, word/footer*.xml
+ * This PRESERVES 100% of original document formatting, tables, images, margins, fonts, headers and footers!
  */
-async function extractTextFromPdfArrayBuffer(buffer: ArrayBuffer): Promise<string> {
-  const bytes = new Uint8Array(buffer);
-  let binaryStr = '';
-  // Convert chunks to avoid stack overflow
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binaryStr += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)));
+export async function patchOriginalDocx(
+  originalBuffer: ArrayBuffer,
+  corrections: Array<{ original: string; replacement: string }>
+): Promise<Blob> {
+  const zip = await JSZip.loadAsync(originalBuffer);
+
+  const replaceInXml = (xml: string): string => {
+    let updated = xml;
+    for (const corr of corrections) {
+      if (!corr.original || !corr.replacement || corr.original === corr.replacement) continue;
+      updated = replaceOpenXmlTextNode(updated, corr.original, corr.replacement);
+    }
+    return updated;
+  };
+
+  // 1. Process word/document.xml
+  const docXmlFile = zip.file('word/document.xml');
+  if (docXmlFile) {
+    const xml = await docXmlFile.async('text');
+    const modified = replaceInXml(xml);
+    zip.file('word/document.xml', modified);
   }
 
-  const extractedChunks: string[] = [];
-
-  // Match text objects BT ... ET
-  const textObjectRegex = /BT[\s\S]*?ET/g;
-  const matches = binaryStr.match(textObjectRegex) || [];
-
-  for (const block of matches) {
-    // Match string literals inside parentheses e.g. (Hello World) Tj
-    const literalMatches = block.match(/\((?:\\.|[^\\\)])*\)\s*(?:Tj|'|")/g) || [];
-    for (const lit of literalMatches) {
-      const clean = lit
-        .replace(/\)\s*(?:Tj|'|")$/, '')
-        .replace(/^\(/, '')
-        .replace(/\\([()\\])/g, '$1')
-        .replace(/\\n/g, '\n')
-        .replace(/\\r/g, '\r')
-        .replace(/\\t/g, '\t');
-      if (clean.trim()) {
-        extractedChunks.push(decodeThaiPdfString(clean));
-      }
-    }
-
-    // Match array elements inside TJ e.g. [(Hello) -10 (World)] TJ
-    const arrayMatches = block.match(/\[(.*?)\]\s*TJ/g) || [];
-    for (const arr of arrayMatches) {
-      const innerLiterals = arr.match(/\((?:\\.|[^\\\)])*\)/g) || [];
-      const combined = innerLiterals
-        .map(l => l.slice(1, -1).replace(/\\([()\\])/g, '$1'))
-        .join('');
-      if (combined.trim()) {
-        extractedChunks.push(decodeThaiPdfString(combined));
+  // 2. Process headers and footers
+  const allFiles = Object.keys(zip.files);
+  for (const path of allFiles) {
+    if (path.startsWith('word/header') || path.startsWith('word/footer')) {
+      const hfFile = zip.file(path);
+      if (hfFile) {
+        const xml = await hfFile.async('text');
+        const modified = replaceInXml(xml);
+        zip.file(path, modified);
       }
     }
   }
 
-  if (extractedChunks.length === 0) {
-    // Try simple regex search for printable Thai and Latin characters if BT/ET wasn't clean
-    const rawMatches = binaryStr.match(/[\u0E00-\u0E7F0-9a-zA-Z\s.,()/:;%#_-]{4,}/g) || [];
-    return rawMatches.filter(s => s.trim().length > 5).join('\n');
-  }
-
-  return extractedChunks.join('\n');
+  // Generate output docx blob preserving all original files
+  return await zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 }
+  });
 }
 
 /**
- * Handle Thai TIS-620 / UTF-8 encoding variations often found in Thai PDFs
+ * Safely replace target word inside OpenXML text elements (<w:t>)
  */
-function decodeThaiPdfString(raw: string): string {
-  // If string contains raw byte values in Thai range 0xA1-0xFB (TIS-620)
-  try {
-    const bytes = new Uint8Array(raw.length);
-    let hasTis620 = false;
-    for (let i = 0; i < raw.length; i++) {
-      const code = raw.charCodeAt(i);
-      bytes[i] = code & 0xff;
-      if (code >= 0xa1 && code <= 0xfb) {
-        hasTis620 = true;
-      }
+export function replaceOpenXmlTextNode(xml: string, target: string, replacement: string): string {
+  if (!xml || !target) return xml;
+
+  const escapeXml = (str: string) =>
+    str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+
+  const escapedTarget = escapeXml(target);
+  const escapedReplacement = escapeXml(replacement);
+
+  let result = xml.replace(/(<w:t(?:\s+[^>]*)?>)([\s\S]*?)(<\/w:t>)/g, (match, openTag, textContent, closeTag) => {
+    if (textContent.includes(escapedTarget)) {
+      return `${openTag}${textContent.split(escapedTarget).join(escapedReplacement)}${closeTag}`;
     }
-    if (hasTis620) {
-      // Decode with TextDecoder windows-874 / tis-620
-      const decoder = new TextDecoder('tis-620');
-      return decoder.decode(bytes);
+    if (textContent.includes(target)) {
+      return `${openTag}${textContent.split(target).join(escapedReplacement)}${closeTag}`;
     }
-  } catch (e) {
-    // Fallback to raw string
-  }
-  return raw;
+    return match;
+  });
+
+  return result;
 }
 
 /**

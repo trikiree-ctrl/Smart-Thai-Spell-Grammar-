@@ -14,6 +14,10 @@ export interface SpellError {
   status: 'pending' | 'accepted' | 'rejected' | 'custom';
   customFix?: string;
   severity: 'high' | 'medium' | 'low';
+  pageNumber: number;
+  lineIndex: number;
+  paragraphIndex: number;
+  context: string;
 }
 
 export interface CheckStats {
@@ -94,6 +98,7 @@ export const THAI_OFFICIAL_LEXICON: Record<string, { suggestion: string; reason:
   'ตรวจจะบ': { suggestion: 'ตรวจสอบ', reason: 'พิมพ์ผิดจาก "ตรวจสอบ"', category: 'spelling', severity: 'high' },
   'ตรวจจะ': { suggestion: 'ตรวจจะ', reason: 'อาจเป็นพิมพ์ผิดจาก "ตรวจสอบ"', category: 'spelling', severity: 'medium' },
   'กฏหมาย': { suggestion: 'กฎหมาย', reason: 'คำว่า "กฎ" ใช้ ฎ.ชฎา (ไม่ใช่ ฏ.ปฏัก)', category: 'spelling', severity: 'high' },
+  'พิจรณา': { suggestion: 'พิจารณา', reason: 'คำที่ถูกต้องคือ "พิจารณา" (มีสระ า ระหว่าง จ และ ร)', category: 'spelling', severity: 'high' },
   'กฏเกณฑ์': { suggestion: 'กฎเกณฑ์', reason: 'ใช้ ฎ.ชฎา ในคำว่า กฎเกณฑ์', category: 'spelling', severity: 'high' },
   'กฏระเบียบ': { suggestion: 'กฎระเบียบ', reason: 'ใช้ ฎ.ชฎา ในคำว่า กฎระเบียบ', category: 'spelling', severity: 'high' },
   'กฏกระทรวง': { suggestion: 'กฎกระทรวง', reason: 'ใช้ ฎ.ชฎา', category: 'spelling', severity: 'high' },
@@ -188,6 +193,48 @@ export const THAI_OFFICIAL_LEXICON: Record<string, { suggestion: string; reason:
 };
 
 /**
+ * Calculate document page number, line number, paragraph number, and context snippet
+ */
+export function computeLocationAndContext(
+  text: string,
+  startIndex: number,
+  length: number
+): { pageNumber: number; lineIndex: number; paragraphIndex: number; context: string } {
+  const textBefore = text.slice(0, startIndex);
+
+  // Detect explicit page breaks (form feeds \f or "--- หน้า X ---" markers)
+  const formFeedMatches = textBefore.match(/\f/g);
+  const pageMarkerMatches = textBefore.match(/---\s*หน้า\s*(\d+)\s*---/gi);
+
+  let pageNumber = 1;
+  if (pageMarkerMatches && pageMarkerMatches.length > 0) {
+    pageNumber = pageMarkerMatches.length;
+  } else if (formFeedMatches && formFeedMatches.length > 0) {
+    pageNumber = formFeedMatches.length + 1;
+  } else {
+    // Standard Thai A4 page estimation: ~1,500 characters
+    pageNumber = Math.max(1, Math.floor(startIndex / 1500) + 1);
+  }
+
+  // Line index
+  const lineIndex = textBefore.split('\n').length;
+
+  // Paragraph index
+  const paragraphIndex = textBefore.split(/\n\s*\n/).length;
+
+  // Context snippet with target word highlighted
+  const typo = text.slice(startIndex, startIndex + length);
+  const startContext = Math.max(0, startIndex - 30);
+  const endContext = Math.min(text.length, startIndex + length + 30);
+
+  const prefix = (startContext > 0 ? '...' : '') + text.substring(startContext, startIndex).replace(/[\r\n]+/g, ' ');
+  const suffix = text.substring(startIndex + length, endContext).replace(/[\r\n]+/g, ' ') + (endContext < text.length ? '...' : '');
+  const context = `${prefix}[${typo}]${suffix}`;
+
+  return { pageNumber, lineIndex, paragraphIndex, context };
+}
+
+/**
  * Common double vowels or misplaced Thai tone mark sanitization rules
  */
 export function checkThaiVowelSyntax(text: string): SpellError[] {
@@ -197,6 +244,7 @@ export function checkThaiVowelSyntax(text: string): SpellError[] {
   const repeatedToneRegex = /([่้๊๋์็])\1+/g;
   let match;
   while ((match = repeatedToneRegex.exec(text)) !== null) {
+    const loc = computeLocationAndContext(text, match.index, match[0].length);
     errors.push({
       id: `syntax_${match.index}`,
       original: match[0],
@@ -206,13 +254,18 @@ export function checkThaiVowelSyntax(text: string): SpellError[] {
       startIndex: match.index,
       endIndex: match.index + match[0].length,
       status: 'pending',
-      severity: 'high'
+      severity: 'high',
+      pageNumber: loc.pageNumber,
+      lineIndex: loc.lineIndex,
+      paragraphIndex: loc.paragraphIndex,
+      context: loc.context
     });
   }
 
   // 2. Double Sara E (เเ -> แ)
   const doubleSaraERegex = /เเ/g;
   while ((match = doubleSaraERegex.exec(text)) !== null) {
+    const loc = computeLocationAndContext(text, match.index, match[0].length);
     errors.push({
       id: `sara_ae_${match.index}`,
       original: match[0],
@@ -222,13 +275,18 @@ export function checkThaiVowelSyntax(text: string): SpellError[] {
       startIndex: match.index,
       endIndex: match.index + match[0].length,
       status: 'pending',
-      severity: 'medium'
+      severity: 'medium',
+      pageNumber: loc.pageNumber,
+      lineIndex: loc.lineIndex,
+      paragraphIndex: loc.paragraphIndex,
+      context: loc.context
     });
   }
 
   // 3. Repeated Maiyamok (ๆๆ -> ๆ)
   const doubleMaiyamokRegex = /ๆ{2,}/g;
   while ((match = doubleMaiyamokRegex.exec(text)) !== null) {
+    const loc = computeLocationAndContext(text, match.index, match[0].length);
     errors.push({
       id: `maiyamok_${match.index}`,
       original: match[0],
@@ -238,7 +296,11 @@ export function checkThaiVowelSyntax(text: string): SpellError[] {
       startIndex: match.index,
       endIndex: match.index + match[0].length,
       status: 'pending',
-      severity: 'low'
+      severity: 'low',
+      pageNumber: loc.pageNumber,
+      lineIndex: loc.lineIndex,
+      paragraphIndex: loc.paragraphIndex,
+      context: loc.context
     });
   }
 
@@ -270,6 +332,7 @@ export function runOfflineLexiconSpellCheck(text: string, customWords: string[] 
       );
 
       if (!alreadyCovered) {
+        const loc = computeLocationAndContext(text, index, typo.length);
         errors.push({
           id: `lexicon_${index}_${typo}`,
           original: typo,
@@ -279,7 +342,11 @@ export function runOfflineLexiconSpellCheck(text: string, customWords: string[] 
           startIndex: index,
           endIndex: index + typo.length,
           status: 'pending',
-          severity: fixInfo.severity
+          severity: fixInfo.severity,
+          pageNumber: loc.pageNumber,
+          lineIndex: loc.lineIndex,
+          paragraphIndex: loc.paragraphIndex,
+          context: loc.context
         });
       }
       index += typo.length;
@@ -491,4 +558,130 @@ export function calculateWeeklyStats(logs: AuditLogEntry[]): WeeklyReportData {
     dailyActivity,
     recommendations
   };
+}
+
+/**
+ * Export errors to CSV format with UTF-8 BOM for Microsoft Excel compatibility
+ */
+export function exportErrorsToCsvBlob(errors: SpellError[], documentName: string): Blob {
+  const headers = [
+    'ลำดับ',
+    'หน้าที่',
+    'ย่อหน้าที่',
+    'บรรทัดที่',
+    'คำผิดเดิม',
+    'คำที่ถูกต้อง/แนะนำ',
+    'คำที่แก้ไขจริง',
+    'หมวดหมู่',
+    'บริบทในเอกสาร',
+    'เหตุผลทางภาษาศาสตร์',
+    'สถานะการตรวจทาน'
+  ];
+
+  const escapeCsv = (val: any) => `"${String(val ?? '').replace(/"/g, '""')}"`;
+
+  const rows = errors.map((err, idx) => {
+    const finalFix = err.status === 'custom' && err.customFix ? err.customFix : (err.status === 'accepted' ? err.suggestion : '-');
+    const categoryName = err.category === 'spelling' ? 'ตัวสะกด'
+      : err.category === 'grammar' ? 'ไวยากรณ์'
+      : err.category === 'formal' ? 'ภาษาทางการ/ศัพท์บัญญัติ' : 'วรรคตอน';
+    const statusName = err.status === 'accepted' ? 'ยืนยันแก้ไข'
+      : err.status === 'rejected' ? 'คงคำเดิม'
+      : err.status === 'custom' ? 'แก้ไขกำหนดเอง' : 'รอการยืนยัน';
+
+    return [
+      idx + 1,
+      err.pageNumber || 1,
+      err.paragraphIndex || 1,
+      err.lineIndex || 1,
+      err.original,
+      err.suggestion,
+      finalFix,
+      categoryName,
+      err.context || `[${err.original}]`,
+      err.reason,
+      statusName
+    ].map(escapeCsv).join(',');
+  });
+
+  const csvContent = '\uFEFF' + [headers.map(escapeCsv).join(','), ...rows].join('\r\n');
+  return new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
+}
+
+/**
+ * Export errors to JSON format for external automation tools & APIs
+ */
+export function exportErrorsToJsonBlob(errors: SpellError[], documentName: string): Blob {
+  const payload = {
+    documentName,
+    exportedAt: new Date().toISOString(),
+    totalErrors: errors.length,
+    acceptedCount: errors.filter(e => e.status === 'accepted' || e.status === 'custom').length,
+    corrections: errors.map((err, idx) => ({
+      index: idx + 1,
+      id: err.id,
+      page: err.pageNumber,
+      line: err.lineIndex,
+      paragraph: err.paragraphIndex,
+      original: err.original,
+      suggestion: err.suggestion,
+      customFix: err.customFix || null,
+      status: err.status,
+      category: err.category,
+      reason: err.reason,
+      context: err.context
+    }))
+  };
+
+  return new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+}
+
+/**
+ * Export errors as Microsoft Word Find & Replace checklist
+ */
+export function exportErrorsToWordFindReplaceText(errors: SpellError[], documentName: string): string {
+  const lines: string[] = [
+    '=========================================================================',
+    `รายการค้นหาและแทนที่คำผิดสำหรับ Microsoft Word (Find & Replace List)`,
+    `เอกสาร: ${documentName}`,
+    `วันที่ส่งออก: ${new Date().toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`,
+    `จำนวนคำผิดทั้งหมด: ${errors.length} รายการ`,
+    '=========================================================================\n'
+  ];
+
+  errors.forEach((err, idx) => {
+    const targetReplacement = err.status === 'custom' && err.customFix ? err.customFix : err.suggestion;
+    lines.push(`ลำดับที่ ${idx + 1}:`);
+    lines.push(`  - ค้นหาคำว่า (Find): "${err.original}"`);
+    lines.push(`  - แทนที่ด้วย (Replace): "${targetReplacement}"`);
+    lines.push(`  - ตำแหน่ง: หน้าที่ ${err.pageNumber || 1}, ย่อหน้าที่ ${err.paragraphIndex || 1}, บรรทัดที่ ${err.lineIndex || 1}`);
+    lines.push(`  - บริบท: ${err.context || `[${err.original}]`}`);
+    lines.push(`  - เหตุผล: ${err.reason}`);
+    lines.push(`  - สถานะ: ${err.status === 'accepted' ? 'ยืนยันแก้ไข' : err.status === 'rejected' ? 'คงคำเดิม' : 'รอตรวจสอบ'}`);
+    lines.push('-------------------------------------------------------------------------');
+  });
+
+  return lines.join('\n');
+}
+
+/**
+ * Copy errors as Markdown table for pasting into documents/chats
+ */
+export function getErrorsMarkdownTable(errors: SpellError[]): string {
+  if (errors.length === 0) return 'ไม่พบรายการคำผิด';
+
+  const rows = [
+    '| ลำดับ | หน้า | ตำแหน่ง | คำผิดเดิม | คำที่ถูกต้อง | บริบทแวดล้อม | สถานะ |',
+    '|:---:|:---:|:---:|:---:|:---:|:---|:---:|'
+  ];
+
+  errors.forEach((err, idx) => {
+    const finalFix = err.status === 'custom' && err.customFix ? err.customFix : (err.status === 'accepted' ? err.suggestion : err.suggestion);
+    const loc = `ย่อหน้า ${err.paragraphIndex || 1}, บรรทัด ${err.lineIndex || 1}`;
+    const cleanContext = (err.context || `[${err.original}]`).replace(/\|/g, '/');
+    const statusText = err.status === 'accepted' ? '✓ ยืนยัน' : err.status === 'rejected' ? '✗ คงเดิม' : 'รอตรวจ';
+    rows.push(`| ${idx + 1} | หน้า ${err.pageNumber || 1} | ${loc} | **${err.original}** | **${finalFix}** | ${cleanContext} | ${statusText} |`);
+  });
+
+  return rows.join('\n');
 }
